@@ -70,6 +70,7 @@ const Dashboard = () => {
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [isMatching, setIsMatching] = useState(false);
   const [matchFound, setMatchFound] = useState<{ username: string; matchId: number } | null>(null);
+  const [unreadCount, setUnreadCount] = useState(0);
 
   const filteredListings = mockSkillListings.filter(
     (listing) =>
