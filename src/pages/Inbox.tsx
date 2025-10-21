@@ -107,30 +107,79 @@ const Inbox = () => {
     loadFriends();
   }, [currentUser]);
 
-  // Handle route param -> select friend
+  // Load messages for selected friend (and handle initial selection)
   useEffect(() => {
-    if (!matchId || !friends.length) return;
-    const friend = friends.find((f) => f.matchId === parseInt(matchId));
-    if (friend) setSelectedFriend(friend);
-    else navigate("/inbox/access-denied");
-  }, [matchId, friends, navigate]);
+    if (!currentUser) return;
 
-  // Load messages for selected friend
-  useEffect(() => {
-    if (!selectedFriend || !currentUser) return;
+    const targetMatchId = matchId ? parseInt(matchId) : null;
+    const currentActiveMatch = selectedFriend?.matchId;
+
+    // Determine if we need to load messages for a NEW match ID
+    // 1. User has a matchId in URL but no selectedFriend yet.
+    // 2. User clicks a different friend (selectedFriend changes).
+    if (targetMatchId === null && currentActiveMatch === null) {
+      // No match selected, no match in URL: show "Select a friend"
+      return;
+    }
+
+    const matchToLoadId = targetMatchId || currentActiveMatch;
+    if (matchToLoadId === null) return;
 
     let cancelled = false;
-    const loadMessages = async () => {
-      setIsLoadingMessages(true);
-      activeMatchRef.current = selectedFriend.matchId;
 
+    const loadMessagesAndFriend = async () => {
+      setIsLoadingMessages(true); // **Move to the top of the fetch**
+      activeMatchRef.current = matchToLoadId;
+
+      // --- 2a. Fetch Friend/Match Details if not yet set ---
+      let friendToUse = selectedFriend;
+      if (!friendToUse || friendToUse.matchId !== matchToLoadId) {
+        // Find friend in already loaded list
+        friendToUse = friends.find((f) => f.matchId === matchToLoadId) || null;
+
+        // If still not found, search the database to check access
+        if (!friendToUse && matchToLoadId) {
+          const { data: friendRow } = await supabase.from("friends").select("user_a, user_b").eq("match_id", matchToLoadId).single();
+
+          if (!friendRow) {
+            navigate("/inbox/access-denied"); // No friendship found
+            return;
+          }
+
+          const otherUserId = friendRow.user_a === currentUser.id ? friendRow.user_b : friendRow.user_a;
+          const { data: userData } = await supabase.from("users").select("username").eq("id", otherUserId).single();
+
+          // Construct a temporary friend object (without unread/lastMessage, which are slow)
+          friendToUse = {
+            matchId: matchToLoadId,
+            userId: otherUserId,
+            username: userData?.username || "Unknown",
+            lastMessageTime: null,
+            unread: 0,
+          };
+        }
+
+        if (friendToUse) {
+          // Update selectedFriend state immediately before setting messages
+          setSelectedFriend(friendToUse);
+        } else {
+          // Final fallback if the match ID is invalid
+          navigate("/inbox/access-denied");
+          return;
+        }
+      }
+
+      // --- 2b. Fetch Messages ---
       const { data, error } = await supabase
         .from("messages")
         .select("id, sender_id, content, sent_at")
-        .eq("match_id", selectedFriend.matchId)
+        .eq("match_id", matchToLoadId)
         .order("sent_at", { ascending: true });
 
-      if (error || cancelled) return;
+      if (error || cancelled || activeMatchRef.current !== matchToLoadId) {
+        setIsLoadingMessages(false);
+        return;
+      }
 
       setMessages(
         data.map((msg: any) => ({
@@ -141,24 +190,28 @@ const Inbox = () => {
         }))
       );
 
+      // --- 2c. Mark as Read and Update Sidebar ---
       await supabase
         .from("messages")
         .update({ is_read: true })
-        .eq("match_id", selectedFriend.matchId)
+        .eq("match_id", matchToLoadId)
         .neq("sender_id", currentUser.id)
         .is("is_read", false);
 
-      setFriends((prev) => prev.map((f) => (f.matchId === selectedFriend.matchId ? { ...f, unread: 0 } : f)));
+      // ONLY update friends list if a friend was selected
+      if (friendToUse) {
+        setFriends((prev) => prev.map((f) => (f.matchId === matchToLoadId ? { ...f, unread: 0 } : f)));
+      }
 
-      setIsLoadingMessages(false);
+      setIsLoadingMessages(false); // **FLICKER END - Done in one go!**
     };
 
-    loadMessages();
+    loadMessagesAndFriend();
 
     return () => {
       cancelled = true;
     };
-  }, [selectedFriend, currentUser]);
+  }, [matchId, friends, currentUser, navigate]); // Added matchId and friends to dependencies
 
   // Realtime listener
   useEffect(() => {
@@ -373,7 +426,7 @@ const Inbox = () => {
               )}
             </div>
 
-            <div className="p-4 border-t-2 border-border">
+            <div className="p-4 border-t-2 border-border" position-fixed>
               <div className="flex gap-2">
                 <Input
                   type="text"

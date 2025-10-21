@@ -70,6 +70,7 @@ const Dashboard = () => {
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [isMatching, setIsMatching] = useState(false);
   const [matchFound, setMatchFound] = useState<{ username: string; matchId: number } | null>(null);
+  const [currentRequestId, setCurrentRequestId] = useState<number | null>(null);
 
   // NEW: unread notifications total
   const [unreadTotal, setUnreadTotal] = useState<number>(0);
@@ -145,41 +146,42 @@ const Dashboard = () => {
   };
 
   const handleRequestMatch = async () => {
-    if (!selectedSkill) {
-      toast({
-        title: "Error",
-        description: "Please select a skill from the list.",
-        variant: "destructive",
-      });
-      return;
-    }
-    if (!user) return;
+    // ... (existing validation and setup)
 
     setIsMatching(true);
     setMatchFound(null);
+    setCurrentRequestId(null); // Clear previous ID
 
     console.log("Requesting match for skill:", selectedSkill.name);
 
-    const { error } = await supabase.from("requests").insert({
-      user_id: user.id,
-      username: user.username,
-      skill_requested: selectedSkill.id,
-    });
+    // Capture the inserted data
+    const { data, error } = await supabase
+      .from("requests")
+      .insert({
+        user_id: user.id,
+        username: user.username,
+        skill_requested: selectedSkill.id,
+      })
+      .select("id") // <-- SELECT the ID of the new request
+      .single();
 
     if (error) {
-      console.error("Error inserting request:", error);
-      toast({ title: "Error", description: error.message, variant: "destructive" });
+      // ... (existing error handling)
       setIsMatching(false);
       return;
     }
 
-    console.log("Request inserted successfully");
+    console.log("Request inserted successfully, ID:", data.id);
+    setCurrentRequestId(data.id); // <-- SET the new ID
   };
 
   // Polling logic kept for safety (backend creates matches). This will still run
   // but the primary notification of match will come from realtime listener below.
+  // Replacement for your existing useEffect polling logic
+  // Replacement for your existing useEffect polling logic
   useEffect(() => {
-    if (!isMatching || !user) return;
+    // 🛑 CRITICAL: We now require a request ID to be set before polling starts.
+    if (!isMatching || !user || currentRequestId === null) return;
 
     let matchCheckCount = 0;
     const maxChecks = Math.ceil(MATCH_TIMEOUT / POLL_INTERVAL);
@@ -188,47 +190,66 @@ const Dashboard = () => {
       try {
         matchCheckCount++;
 
-        const { data: matches, error } = await supabase
-          .from("matches")
-          .select("id, user_a, user_b, matched_at")
-          .or(`user_a.eq.${user.id},user_b.eq.${user.id}`)
-          .order("matched_at", { ascending: false })
-          .limit(1);
+        // CHECK: Does the original request still exist?
+        // This is the single most important check for the "already friends" scenario.
+        const { error: reqError, count: reqCount } = await supabase
+          .from("requests")
+          .select("id", { count: "exact", head: true })
+          .eq("id", currentRequestId);
 
-        if (error) {
-          console.error("Error polling for match:", error);
+        if (reqError) throw reqError;
+
+        // If the request is GONE (reqCount === 0), it means:
+        // 1. A NEW match was found (handled by the Realtime listener which should have already fired).
+        // 2. The match was an existing friend (handled by the SQL trigger's 'delete' block).
+        // In case #2, we MUST clear the stale matchFound state.
+        if (reqCount === 0) {
+          // If the user's state hasn't been updated by the Realtime listener (e.g., if they were
+          // matched with an existing friend), we stop searching and reset the state.
+
+          // Check if Realtime *already* set matchFound for a new match.
+          if (!matchFound) {
+            // No new match was found, therefore the request was deleted due to existing friendship.
+            setIsMatching(false);
+            // Explicitly clear any stale/old match state left over from a previous session
+            setMatchFound(null);
+            setCurrentRequestId(null); // Clean up
+
+            toast({
+              title: "Existing Connection Found",
+              description: "You've already matched with a user who requested that skill! Check your inbox.",
+              duration: 7000,
+            });
+            return; // Stop polling
+          }
+
+          // If matchFound is true, the realtime listener already handled the successful match,
+          // so we just stop the polling loop.
+          setIsMatching(false);
+          setCurrentRequestId(null);
           return;
         }
 
-        if (matches && matches.length > 0) {
-          const match = matches[0];
-          const otherUserId = match.user_a === user.id ? match.user_b : match.user_a;
-
-          const { data: otherUser } = await supabase.from("users").select("username").eq("id", otherUserId).single();
-
-          if (otherUser?.username) {
-            console.log("Match found:", otherUser.username);
-            setMatchFound({ username: otherUser.username, matchId: match.id });
-            setIsMatching(false);
-            toast({
-              title: "Match Found!",
-              description: `You matched with ${otherUser.username}!`,
-              duration: 7000,
-            });
-            return;
-          }
-        }
-
+        // -------------------------------------------------------------
+        // Standard Timeout Logic (Only runs if request still exists)
+        // -------------------------------------------------------------
         if (matchCheckCount >= maxChecks) {
           setIsMatching(false);
+          setCurrentRequestId(null); // Clean up
+          setMatchFound(null); // Explicitly clear any stale match state
+
           toast({
             title: "No users online",
-            description: "No match found right now. Check your inbox later when a match is found!",
+            description: "No reciprocal match found right now. Your request is open!",
             duration: 5000,
           });
         }
       } catch (err) {
         console.error("Polling error:", err);
+        // On error, stop matching
+        setIsMatching(false);
+        setCurrentRequestId(null);
+        setMatchFound(null);
       }
     };
 
@@ -238,7 +259,7 @@ const Dashboard = () => {
     return () => {
       clearInterval(interval);
     };
-  }, [isMatching, user]);
+  }, [isMatching, user, currentRequestId, matchFound]); // Added matchFound to dependencies // Dependency on currentRequestId is important
 
   // Realtime listener for matches (notifies when backend inserts into matches)
   useEffect(() => {
@@ -314,6 +335,7 @@ const Dashboard = () => {
   useEffect(() => {
     fetchUser();
     fetchSkills();
+    setMatchFound(null);
   }, []);
 
   return (
@@ -530,6 +552,29 @@ const Dashboard = () => {
           </Card>
         </div>
       </main>
+      {/* Matching Overlay */}
+      {(isMatching || matchFound) && (
+        <div className="fixed inset-0 z-[999] flex items-center justify-center backdrop-blur-md bg-background/60">
+          <div className="text-center space-y-6 animate-fade-in">
+            {!matchFound ? (
+              <>
+                <div className="w-16 h-16 mx-auto border-4 border-muted-foreground border-t-foreground rounded-full animate-spin" />
+                <p className="text-2xl md:text-3xl font-mono font-bold text-foreground animate-pulse">Searching for a match...</p>
+              </>
+            ) : (
+              <>
+                <p className="text-2xl md:text-3xl font-mono font-bold text-green-500">✅ Matched with {matchFound.username}!</p>
+                <Button
+                  onClick={() => navigate(`/inbox/${matchFound.matchId}`)}
+                  className="px-6 py-3 text-lg font-mono font-bold border-2 border-green-600 hover:bg-green-600 hover:text-white"
+                >
+                  Go to Chat
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
