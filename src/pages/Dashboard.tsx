@@ -70,7 +70,9 @@ const Dashboard = () => {
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [isMatching, setIsMatching] = useState(false);
   const [matchFound, setMatchFound] = useState<{ username: string; matchId: number } | null>(null);
-  const [unreadCount, setUnreadCount] = useState(0);
+
+  // NEW: unread notifications total
+  const [unreadTotal, setUnreadTotal] = useState<number>(0);
 
   const filteredListings = mockSkillListings.filter(
     (listing) =>
@@ -78,6 +80,7 @@ const Dashboard = () => {
       listing.username.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  // fetchUser & skills (unchanged structure)
   const fetchUser = async () => {
     try {
       const { data: currentUser } = await supabase.auth.getUser();
@@ -118,6 +121,23 @@ const Dashboard = () => {
     }
   };
 
+  const fetchUnreadTotal = async (currentUserId: string) => {
+    // count messages where is_read = false and sender_id != currentUserId
+    // The logic assumes messages table has is_read boolean (recommended for MVP).
+    // This will count unread across all matches where sender != current user.
+    const { count, error } = await supabase
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .neq("sender_id", currentUserId)
+      .is("is_read", false);
+
+    if (error) {
+      console.error("Error fetching unread total:", error);
+      return;
+    }
+    setUnreadTotal(count || 0);
+  };
+
   const handleLogout = async () => {
     await supabase.auth.signOut();
     navigate("/auth");
@@ -156,6 +176,8 @@ const Dashboard = () => {
     console.log("Request inserted successfully");
   };
 
+  // Polling logic kept for safety (backend creates matches). This will still run
+  // but the primary notification of match will come from realtime listener below.
   useEffect(() => {
     if (!isMatching || !user) return;
 
@@ -218,10 +240,9 @@ const Dashboard = () => {
     };
   }, [isMatching, user]);
 
+  // Realtime listener for matches (notifies when backend inserts into matches)
   useEffect(() => {
     if (!user) return;
-
-    console.log("Setting up Realtime listener for matches");
 
     const channel = supabase
       .channel(`matches-${user.id}`)
@@ -234,14 +255,14 @@ const Dashboard = () => {
         },
         async (payload) => {
           const match = payload.new;
-
           if (match.user_a === user.id || match.user_b === user.id) {
             const otherUserId = match.user_a === user.id ? match.user_b : match.user_a;
             const { data: otherUser } = await supabase.from("users").select("username").eq("id", otherUserId).single();
 
             if (otherUser?.username) {
-              console.log("Match notification received:", otherUser.username);
+              console.log("Realtime match detected:", otherUser.username);
               setMatchFound({ username: otherUser.username, matchId: match.id });
+              setIsMatching(false);
               toast({
                 title: "Match Found!",
                 description: `You matched with ${otherUser.username}!`,
@@ -251,13 +272,42 @@ const Dashboard = () => {
           }
         }
       )
-      .subscribe((status) => {
-        console.log("Realtime subscription status:", status);
-      });
+      .subscribe();
 
     return () => {
-      console.log("Unsubscribing from Realtime");
       supabase.removeChannel(channel);
+    };
+  }, [user]);
+
+  // Realtime listener for all new messages -> used to update unread badge
+  useEffect(() => {
+    let channel: any;
+    if (!user) return;
+
+    channel = supabase
+      .channel(`messages-global-${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+        },
+        (payload) => {
+          const msg = payload.new;
+          // If the new message was sent by someone else, increment unreadTotal.
+          if (msg.sender_id !== user.id) {
+            setUnreadTotal((prev) => prev + 1);
+          }
+        }
+      )
+      .subscribe();
+
+    // initialize unread total once
+    fetchUnreadTotal(user.id);
+
+    return () => {
+      if (channel) supabase.removeChannel(channel);
     };
   }, [user]);
 
@@ -268,23 +318,24 @@ const Dashboard = () => {
 
   return (
     <div className="min-h-screen bg-background">
+      {/* Header */}
       <header className="sticky top-0 z-50 border-b-2 border-border bg-background">
         <div className="container mx-auto px-4 py-4 flex items-center justify-between gap-4">
           <h1 className="text-2xl font-bold font-mono">SKILLSWAP</h1>
 
+          {/* Search Bar */}
           <div className="relative flex-1 max-w-md">
             <input
               type="text"
               placeholder="> search skills..."
               value={searchQuery}
               onChange={(e) => {
-                const query = e.target.value;
-                setSearchQuery(query);
-                const found = skills.find((s) => s.name.toLowerCase() === query.toLowerCase());
+                setSearchQuery(e.target.value);
+                const found = skills.find((s) => s.name.toLowerCase() === e.target.value.toLowerCase());
                 setSelectedSkill(found || null);
               }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") handleRequestMatch();
+                if (e.key === "Enter" && selectedSkill) handleRequestMatch();
               }}
               disabled={isMatching}
               className="pl-10 pr-10 font-mono border-2 bg-background w-full disabled:opacity-50"
@@ -320,6 +371,7 @@ const Dashboard = () => {
               </ul>
             )}
 
+            {/* Floating status */}
             <div className="absolute top-full left-0 w-full text-center mt-2 font-mono text-sm pointer-events-none">
               {isMatching && <div className="animate-pulse text-muted-foreground">🔄 Searching for a match...</div>}
               {matchFound && (
@@ -336,6 +388,7 @@ const Dashboard = () => {
             </div>
           </div>
 
+          {/* User Info */}
           <div className="flex items-center gap-4">
             <div className="text-right hidden sm:block">
               <p className="text-xs font-mono text-muted-foreground">POINTS</p>
@@ -346,15 +399,29 @@ const Dashboard = () => {
                 {user?.username ? user.username.slice(0, 2).toUpperCase() : "U"}
               </AvatarFallback>
             </Avatar>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => navigate("/inbox")}
-              className="border-2 border-border hover:bg-secondary"
-              title="View Chats"
-            >
-              <MessageSquare className="w-4 h-4" />
-            </Button>
+
+            {/* Inbox button with unread badge */}
+            <div className="relative">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  setUnreadTotal(0); // optional: clear badge when opening inbox
+                  navigate("/inbox");
+                }}
+                className="border-2 border-border hover:bg-secondary"
+                title="View Chats"
+              >
+                <MessageSquare className="w-4 h-4" />
+              </Button>
+
+              {unreadTotal > 0 && (
+                <div className="absolute -top-1 -right-1 min-w-[18px] h-5 rounded-full bg-black text-white text-xs flex items-center justify-center px-1">
+                  {unreadTotal}
+                </div>
+              )}
+            </div>
+
             <Button
               variant="ghost"
               size="icon"
@@ -367,6 +434,7 @@ const Dashboard = () => {
         </div>
       </header>
 
+      {/* Main */}
       <main className="container mx-auto px-4 py-8">
         <h2 className="text-xl font-bold font-mono mb-6">AVAILABLE SKILL SWAPS</h2>
 

@@ -1,9 +1,8 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Input } from "@/components/ui/input";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { toast } from "@/hooks/use-toast";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Send, Trash2 } from "lucide-react";
@@ -13,6 +12,7 @@ interface Friend {
   userId: string;
   username: string;
   lastMessageTime: string | null;
+  unread?: number;
 }
 
 interface Message {
@@ -27,8 +27,6 @@ interface CurrentUser {
   username: string;
 }
 
-const POLL_INTERVAL = 3000;
-
 const Inbox = () => {
   const navigate = useNavigate();
   const { matchId } = useParams<{ matchId: string }>();
@@ -41,13 +39,13 @@ const Inbox = () => {
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [isSending, setIsSending] = useState(false);
 
-  // Check authentication and load user
+  const activeMatchRef = useRef<number | null>(null); // prevents async race conditions
+
+  // Load user
   useEffect(() => {
     const checkAuth = async () => {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
+      const { data } = await supabase.auth.getUser();
+      const user = data?.user;
       if (!user) {
         navigate("/auth");
         return;
@@ -55,57 +53,50 @@ const Inbox = () => {
 
       const { data: userData } = await supabase.from("users").select("id, username").eq("id", user.id).single();
 
-      if (userData) {
-        setCurrentUser({ id: userData.id, username: userData.username });
-      }
+      if (userData) setCurrentUser({ id: userData.id, username: userData.username });
     };
-
     checkAuth();
   }, [navigate]);
 
-  // Load friends list
+  // Load friends
   useEffect(() => {
     if (!currentUser) return;
 
     const loadFriends = async () => {
       const { data: friendsData, error } = await supabase
         .from("friends")
-        .select(
-          `
-          match_id,
-          user_a,
-          user_b,
-          created_at
-        `
-        )
+        .select("match_id, user_a, user_b, created_at")
         .or(`user_a.eq.${currentUser.id},user_b.eq.${currentUser.id}`)
         .order("created_at", { ascending: false });
 
-      if (error) {
-        console.error("Error loading friends:", error);
-        return;
-      }
+      if (error || !friendsData) return;
 
-      // Fetch usernames and last message times
       const friendsList: Friend[] = await Promise.all(
-        friendsData.map(async (friend) => {
-          const otherUserId = friend.user_a === currentUser.id ? friend.user_b : friend.user_a;
-
+        friendsData.map(async (row) => {
+          const otherUserId = row.user_a === currentUser.id ? row.user_b : row.user_a;
           const { data: userData } = await supabase.from("users").select("username").eq("id", otherUserId).single();
+
+          const { count: unreadCount } = await supabase
+            .from("messages")
+            .select("id", { head: true, count: "exact" })
+            .eq("match_id", row.match_id)
+            .neq("sender_id", currentUser.id)
+            .is("is_read", false);
 
           const { data: lastMessage } = await supabase
             .from("messages")
             .select("sent_at")
-            .eq("match_id", friend.match_id)
+            .eq("match_id", row.match_id)
             .order("sent_at", { ascending: false })
             .limit(1)
             .single();
 
           return {
-            matchId: friend.match_id,
+            matchId: row.match_id,
             userId: otherUserId,
             username: userData?.username || "Unknown",
             lastMessageTime: lastMessage?.sent_at || null,
+            unread: unreadCount || 0,
           };
         })
       );
@@ -116,56 +107,62 @@ const Inbox = () => {
     loadFriends();
   }, [currentUser]);
 
-  // Handle match ID from URL parameter
+  // Handle route param -> select friend
   useEffect(() => {
     if (!matchId || !friends.length) return;
-
     const friend = friends.find((f) => f.matchId === parseInt(matchId));
-    if (friend) {
-      setSelectedFriend(friend);
-    } else {
-      // User doesn't have access to this match
-      navigate("/inbox/access-denied");
-    }
+    if (friend) setSelectedFriend(friend);
+    else navigate("/inbox/access-denied");
   }, [matchId, friends, navigate]);
 
   // Load messages for selected friend
   useEffect(() => {
-    if (!selectedFriend) return;
+    if (!selectedFriend || !currentUser) return;
 
+    let cancelled = false;
     const loadMessages = async () => {
       setIsLoadingMessages(true);
+      activeMatchRef.current = selectedFriend.matchId;
 
-      const { data: messagesData, error } = await supabase
+      const { data, error } = await supabase
         .from("messages")
         .select("id, sender_id, content, sent_at")
         .eq("match_id", selectedFriend.matchId)
         .order("sent_at", { ascending: true });
 
-      if (error) {
-        console.error("Error loading messages:", error);
-      } else {
-        setMessages(
-          messagesData.map((msg) => ({
-            id: msg.id,
-            senderId: msg.sender_id,
-            content: msg.content,
-            sentAt: msg.sent_at,
-          }))
-        );
-      }
+      if (error || cancelled) return;
+
+      setMessages(
+        data.map((msg: any) => ({
+          id: msg.id,
+          senderId: msg.sender_id,
+          content: msg.content,
+          sentAt: msg.sent_at,
+        }))
+      );
+
+      await supabase
+        .from("messages")
+        .update({ is_read: true })
+        .eq("match_id", selectedFriend.matchId)
+        .neq("sender_id", currentUser.id)
+        .is("is_read", false);
+
+      setFriends((prev) => prev.map((f) => (f.matchId === selectedFriend.matchId ? { ...f, unread: 0 } : f)));
 
       setIsLoadingMessages(false);
     };
 
     loadMessages();
-  }, [selectedFriend]);
 
-  // Realtime listener for new messages
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFriend, currentUser]);
+
+  // Realtime listener
   useEffect(() => {
     if (!selectedFriend || !currentUser) return;
-
-    console.log("Setting up Realtime listener for messages");
 
     const channel = supabase
       .channel(`messages-${selectedFriend.matchId}`)
@@ -177,84 +174,86 @@ const Inbox = () => {
           table: "messages",
           filter: `match_id=eq.${selectedFriend.matchId}`,
         },
-        (payload) => {
-          console.log("New message received:", payload);
-          const newMessage = payload.new;
+        async (payload: any) => {
+          const newMsg = payload.new;
+          if (activeMatchRef.current !== selectedFriend.matchId) return; // ignore old channels
           setMessages((prev) => [
             ...prev,
             {
-              id: newMessage.id,
-              senderId: newMessage.sender_id,
-              content: newMessage.content,
-              sentAt: newMessage.sent_at,
+              id: newMsg.id,
+              senderId: newMsg.sender_id,
+              content: newMsg.content,
+              sentAt: newMsg.sent_at,
             },
           ]);
+
+          if (newMsg.sender_id !== currentUser.id) {
+            await supabase.from("messages").update({ is_read: true }).eq("id", newMsg.id);
+          }
         }
       )
-      .subscribe((status) => {
-        console.log("Messages Realtime status:", status);
-      });
+      .subscribe();
 
     return () => {
-      console.log("Unsubscribing from messages Realtime");
       supabase.removeChannel(channel);
     };
   }, [selectedFriend, currentUser]);
 
-  // Polling fallback for messages
-  useEffect(() => {
-    if (!selectedFriend) return;
-
-    const pollMessages = async () => {
-      const { data: messagesData } = await supabase
-        .from("messages")
-        .select("id, sender_id, content, sent_at")
-        .eq("match_id", selectedFriend.matchId)
-        .order("sent_at", { ascending: true });
-
-      if (messagesData) {
-        setMessages(
-          messagesData.map((msg) => ({
-            id: msg.id,
-            senderId: msg.sender_id,
-            content: msg.content,
-            sentAt: msg.sent_at,
-          }))
-        );
-      }
-    };
-
-    const interval = setInterval(pollMessages, POLL_INTERVAL);
-    return () => clearInterval(interval);
-  }, [selectedFriend]);
-
   // Send message
   const handleSendMessage = async () => {
     if (!messageInput.trim() || !selectedFriend || !currentUser) return;
-
     setIsSending(true);
 
     const { error } = await supabase.from("messages").insert({
       match_id: selectedFriend.matchId,
       sender_id: currentUser.id,
       content: messageInput.trim(),
+      is_read: false,
     });
 
-    if (error) {
-      console.error("Error sending message:", error);
+    if (error)
       toast({
         title: "Error",
         description: "Failed to send message",
         variant: "destructive",
       });
-    } else {
-      setMessageInput("");
-    }
+    else setMessageInput("");
 
     setIsSending(false);
   };
 
-  // Format timestamp to IST
+  // Delete + Block
+  const handleDeleteAndBlock = async (friend: Friend) => {
+    if (!currentUser) return;
+    const confirmDelete = confirm(`Delete chat with ${friend.username} and block them?`);
+    if (!confirmDelete) return;
+
+    try {
+      await supabase.from("blocked_users").insert([
+        { blocker_id: currentUser.id, blocked_id: friend.userId },
+        { blocker_id: friend.userId, blocked_id: currentUser.id },
+      ]);
+
+      await supabase.from("friends").delete().eq("match_id", friend.matchId);
+      await supabase.from("matches").delete().eq("id", friend.matchId);
+
+      setFriends((prev) => prev.filter((f) => f.matchId !== friend.matchId));
+      if (selectedFriend?.matchId === friend.matchId) {
+        setSelectedFriend(null);
+        setMessages([]);
+        navigate("/inbox");
+      }
+
+      toast({ title: "Blocked", description: `${friend.username} blocked.` });
+    } catch (err) {
+      toast({
+        title: "Error",
+        description: "Failed to delete & block user",
+        variant: "destructive",
+      });
+    }
+  };
+
   const formatTimestamp = (timestamp: string) => {
     const date = new Date(timestamp);
     return date.toLocaleString("en-IN", {
@@ -266,17 +265,16 @@ const Inbox = () => {
     });
   };
 
-  if (!currentUser) {
+  if (!currentUser)
     return (
-      <div className="min-h-screen bg-background flex items-center justify-center">
+      <div className="min-h-screen flex items-center justify-center">
         <p className="font-mono text-muted-foreground">Loading...</p>
       </div>
     );
-  }
 
   return (
-    <div className="min-h-screen bg-background flex">
-      {/* Friends sidebar */}
+    <div className="min-h-screen flex bg-background">
+      {/* Sidebar */}
       <div className="w-80 border-r-2 border-border flex flex-col">
         <div className="p-4 border-b-2 border-border">
           <div className="flex items-center gap-3 mb-4">
@@ -289,9 +287,7 @@ const Inbox = () => {
 
         <div className="flex-1 overflow-y-auto">
           {friends.length === 0 ? (
-            <div className="p-4 text-center">
-              <p className="font-mono text-sm text-muted-foreground">No matches yet. Start swapping skills!</p>
-            </div>
+            <div className="p-4 text-center text-sm font-mono text-muted-foreground">No matches yet. Start swapping skills!</div>
           ) : (
             friends.map((friend) => (
               <div
@@ -300,7 +296,7 @@ const Inbox = () => {
                   setSelectedFriend(friend);
                   navigate(`/inbox/${friend.matchId}`);
                 }}
-                className={`p-4 border-b border-border cursor-pointer hover:bg-secondary transition-colors ${
+                className={`p-4 border-b border-border cursor-pointer hover:bg-secondary transition-colors relative ${
                   selectedFriend?.matchId === friend.matchId ? "bg-secondary" : ""
                 }`}
               >
@@ -316,6 +312,21 @@ const Inbox = () => {
                       <p className="text-xs text-muted-foreground font-mono">{formatTimestamp(friend.lastMessageTime)}</p>
                     )}
                   </div>
+                  {friend.unread && friend.unread > 0 && (
+                    <div className="ml-2 min-w-[22px] h-6 rounded-full bg-black text-white text-xs flex items-center justify-center px-2">
+                      {friend.unread}
+                    </div>
+                  )}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDeleteAndBlock(friend);
+                    }}
+                    className="ml-3 p-1 rounded hover:bg-muted-foreground/20"
+                    title="Delete & Block"
+                  >
+                    <Trash2 className="w-4 h-4 stroke-[2] text-black" />
+                  </button>
                 </div>
               </div>
             ))
@@ -323,40 +334,36 @@ const Inbox = () => {
         </div>
       </div>
 
-      {/* Chat window */}
+      {/* Chat Window */}
       <div className="flex-1 flex flex-col">
         {selectedFriend ? (
           <>
-            {/* Chat header */}
-            <div className="p-4 border-b-2 border-border">
-              <div className="flex items-center gap-3">
-                <Avatar className="border-2 border-border">
-                  <AvatarFallback className="font-mono bg-primary text-primary-foreground">
-                    {selectedFriend.username.slice(0, 2).toUpperCase()}
-                  </AvatarFallback>
-                </Avatar>
-                <h2 className="font-bold font-mono">{selectedFriend.username}</h2>
-              </div>
+            <div className="p-4 border-b-2 border-border flex items-center gap-3">
+              <Avatar className="border-2 border-border">
+                <AvatarFallback className="font-mono bg-primary text-primary-foreground">
+                  {selectedFriend.username.slice(0, 2).toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
+              <h2 className="font-bold font-mono">{selectedFriend.username}</h2>
             </div>
 
-            {/* Messages area */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
               {isLoadingMessages ? (
-                <div className="text-center text-muted-foreground font-mono text-sm">Loading messages...</div>
+                <p className="text-center text-muted-foreground font-mono text-sm">Loading messages...</p>
               ) : messages.length === 0 ? (
-                <div className="text-center text-muted-foreground font-mono text-sm">No messages yet. Start the conversation!</div>
+                <p className="text-center text-muted-foreground font-mono text-sm">No messages yet. Start the conversation!</p>
               ) : (
                 messages.map((message) => {
-                  const isOwnMessage = message.senderId === currentUser.id;
+                  const isOwn = message.senderId === currentUser.id;
                   return (
-                    <div key={message.id} className={`flex ${isOwnMessage ? "justify-end" : "justify-start"}`}>
+                    <div key={message.id} className={`flex ${isOwn ? "justify-end" : "justify-start"}`}>
                       <div
                         className={`max-w-xs px-4 py-2 rounded-lg ${
-                          isOwnMessage ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground"
+                          isOwn ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground"
                         }`}
                       >
                         <p className="font-mono text-sm break-words">{message.content}</p>
-                        <p className={`text-xs font-mono mt-1 ${isOwnMessage ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
+                        <p className={`text-xs font-mono mt-1 ${isOwn ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
                           {formatTimestamp(message.sentAt)}
                         </p>
                       </div>
@@ -366,7 +373,6 @@ const Inbox = () => {
               )}
             </div>
 
-            {/* Message input */}
             <div className="p-4 border-t-2 border-border">
               <div className="flex gap-2">
                 <Input
