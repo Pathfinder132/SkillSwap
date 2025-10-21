@@ -43,7 +43,7 @@ const Inbox = () => {
 
   // Load user
   useEffect(() => {
-    const checkAuth = async () => {
+    /* const checkAuth = async () => {
       const { data } = await supabase.auth.getUser();
       const user = data?.user;
       if (!user) {
@@ -55,7 +55,20 @@ const Inbox = () => {
 
       if (userData) setCurrentUser({ id: userData.id, username: userData.username });
     };
-    checkAuth();
+    checkAuth();*/
+    if (!currentUser) {
+      const loadUserFromSupabase = async () => {
+        const { data: userSession } = await supabase.auth.getUser();
+        if (!userSession.user) {
+          // This should be unreachable if App.tsx works, but is a fail-safe
+          navigate("/auth");
+          return;
+        }
+        const { data: userData } = await supabase.from("users").select("id, username").eq("id", userSession.user.id).single();
+        if (userData) setCurrentUser({ id: userData.id, username: userData.username });
+      };
+      loadUserFromSupabase();
+    }
   }, [navigate]);
 
   // Load friends
@@ -108,48 +121,66 @@ const Inbox = () => {
   }, [currentUser]);
 
   // Load messages for selected friend (and handle initial selection)
+  // Load messages for selected friend (and handle initial selection)
   useEffect(() => {
     if (!currentUser) return;
 
     const targetMatchId = matchId ? parseInt(matchId) : null;
-    const currentActiveMatch = selectedFriend?.matchId;
+    const currentActiveMatch = selectedFriend?.matchId || null;
+    const matchToLoadId = targetMatchId || currentActiveMatch;
 
-    // Determine if we need to load messages for a NEW match ID
-    // 1. User has a matchId in URL but no selectedFriend yet.
-    // 2. User clicks a different friend (selectedFriend changes).
-    if (targetMatchId === null && currentActiveMatch === null) {
-      // No match selected, no match in URL: show "Select a friend"
+    // SCENARIO 1: Navigated to /inbox (no match ID in URL)
+    // Ensure chat window is empty if no friend is selected (or if URL changed from a match to just /inbox)
+    if (targetMatchId === null) {
+      if (selectedFriend !== null) {
+        setSelectedFriend(null);
+        setMessages([]);
+      }
+      // STOP HERE. We are on the list view.
       return;
     }
 
-    const matchToLoadId = targetMatchId || currentActiveMatch;
-    if (matchToLoadId === null) return;
+    // SCENARIO 2: Navigated to /inbox/:matchId (match ID IS in URL)
+    if (matchToLoadId === null) return; // Should not happen given the check above, but for safety.
 
     let cancelled = false;
 
     const loadMessagesAndFriend = async () => {
-      setIsLoadingMessages(true); // **Move to the top of the fetch**
+      setIsLoadingMessages(true);
       activeMatchRef.current = matchToLoadId;
 
-      // --- 2a. Fetch Friend/Match Details if not yet set ---
       let friendToUse = selectedFriend;
+
+      // --- 1. Fetch Friend/Match Details if not already set or correct ---
       if (!friendToUse || friendToUse.matchId !== matchToLoadId) {
-        // Find friend in already loaded list
+        // Look in the locally loaded friends list first
         friendToUse = friends.find((f) => f.matchId === matchToLoadId) || null;
 
-        // If still not found, search the database to check access
-        if (!friendToUse && matchToLoadId) {
-          const { data: friendRow } = await supabase.from("friends").select("user_a, user_b").eq("match_id", matchToLoadId).single();
+        // Fallback: Query the database only if not found locally AND a matchId is in the URL
+        if (!friendToUse && targetMatchId) {
+          // Check for friendship (as you correctly did)
+          const { data: friendRow, error: friendError } = await supabase
+            .from("friends")
+            .select("user_a, user_b")
+            .eq("match_id", matchToLoadId)
+            .or(`user_a.eq.${currentUser.id},user_b.eq.${currentUser.id}`)
+            .maybeSingle(); // Use maybeSingle to get null on no match
+
+          if (friendError) {
+            console.error(`Error checking friendship for match ID ${matchToLoadId}:`, friendError);
+          }
 
           if (!friendRow) {
-            navigate("/inbox/access-denied"); // No friendship found
+            // 🛑 CRITICAL CHANGE: Only redirect to access-denied if a matchId was in the URL
+            console.warn(`DEBUG: No friendship found in DB for URL match ID ${matchToLoadId}. Access denied.`);
+            navigate("/inbox/access-denied");
+            setIsLoadingMessages(false);
             return;
           }
 
           const otherUserId = friendRow.user_a === currentUser.id ? friendRow.user_b : friendRow.user_a;
           const { data: userData } = await supabase.from("users").select("username").eq("id", otherUserId).single();
 
-          // Construct a temporary friend object (without unread/lastMessage, which are slow)
           friendToUse = {
             matchId: matchToLoadId,
             userId: otherUserId,
@@ -159,17 +190,19 @@ const Inbox = () => {
           };
         }
 
+        // Update state if a valid friend was found
         if (friendToUse) {
-          // Update selectedFriend state immediately before setting messages
           setSelectedFriend(friendToUse);
         } else {
-          // Final fallback if the match ID is invalid
+          // Fallback for cases where matchToLoadId exists but no friend data was retrieved
+          // (e.g., if matchId was in URL but the DB check above was skipped/failed)
           navigate("/inbox/access-denied");
+          setIsLoadingMessages(false);
           return;
         }
       }
 
-      // --- 2b. Fetch Messages ---
+      // --- 2. Fetch Messages ---
       const { data, error } = await supabase
         .from("messages")
         .select("id, sender_id, content, sent_at")
@@ -190,7 +223,7 @@ const Inbox = () => {
         }))
       );
 
-      // --- 2c. Mark as Read and Update Sidebar ---
+      // --- 3. Mark as Read and Update Sidebar ---
       await supabase
         .from("messages")
         .update({ is_read: true })
@@ -198,12 +231,11 @@ const Inbox = () => {
         .neq("sender_id", currentUser.id)
         .is("is_read", false);
 
-      // ONLY update friends list if a friend was selected
       if (friendToUse) {
         setFriends((prev) => prev.map((f) => (f.matchId === matchToLoadId ? { ...f, unread: 0 } : f)));
       }
 
-      setIsLoadingMessages(false); // **FLICKER END - Done in one go!**
+      setIsLoadingMessages(false);
     };
 
     loadMessagesAndFriend();
@@ -211,7 +243,7 @@ const Inbox = () => {
     return () => {
       cancelled = true;
     };
-  }, [matchId, friends, currentUser, navigate]); // Added matchId and friends to dependencies
+  }, [matchId, friends, currentUser, navigate, selectedFriend]); // Dependencies remain the same
 
   // Realtime listener
   useEffect(() => {
@@ -282,11 +314,13 @@ const Inbox = () => {
     if (!confirmDelete) return;
 
     try {
+      // Blocking logic
       await supabase.from("blocked_users").insert([
         { blocker_id: currentUser.id, blocked_id: friend.userId },
         { blocker_id: friend.userId, blocked_id: currentUser.id },
       ]);
 
+      // Deleting match and friend relationship
       await supabase.from("friends").delete().eq("match_id", friend.matchId);
       await supabase.from("matches").delete().eq("id", friend.matchId);
 
@@ -294,7 +328,7 @@ const Inbox = () => {
       if (selectedFriend?.matchId === friend.matchId) {
         setSelectedFriend(null);
         setMessages([]);
-        navigate("/inbox");
+        navigate("/inbox"); // Navigate back to the main inbox view
       }
 
       toast({ title: "Blocked", description: `${friend.username} blocked.` });
