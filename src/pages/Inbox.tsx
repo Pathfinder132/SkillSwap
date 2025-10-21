@@ -40,7 +40,8 @@ const Inbox = () => {
   const [isSending, setIsSending] = useState(false);
 
   const activeMatchRef = useRef<number | null>(null); // prevents async race conditions
-
+  const messageInputRef = useRef<HTMLInputElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   // Load user
   useEffect(() => {
     /* const checkAuth = async () => {
@@ -121,85 +122,73 @@ const Inbox = () => {
   }, [currentUser]);
 
   // Load messages for selected friend (and handle initial selection)
-  // Load messages for selected friend (and handle initial selection)
+
   useEffect(() => {
     if (!currentUser) return;
 
     const targetMatchId = matchId ? parseInt(matchId) : null;
-    const currentActiveMatch = selectedFriend?.matchId || null;
-    const matchToLoadId = targetMatchId || currentActiveMatch;
 
     // SCENARIO 1: Navigated to /inbox (no match ID in URL)
-    // Ensure chat window is empty if no friend is selected (or if URL changed from a match to just /inbox)
     if (targetMatchId === null) {
       if (selectedFriend !== null) {
         setSelectedFriend(null);
         setMessages([]);
       }
-      // STOP HERE. We are on the list view.
       return;
     }
 
-    // SCENARIO 2: Navigated to /inbox/:matchId (match ID IS in URL)
-    if (matchToLoadId === null) return; // Should not happen given the check above, but for safety.
+    // SCENARIO 2: Navigated to /inbox/:matchId
+    const matchToLoadId = targetMatchId;
+    if (matchToLoadId === null) return;
 
     let cancelled = false;
 
     const loadMessagesAndFriend = async () => {
-      setIsLoadingMessages(true);
+      // 💡 CRITICAL: Set ref immediately to prevent race conditions from other useEffect runs
       activeMatchRef.current = matchToLoadId;
+      setIsLoadingMessages(true);
 
-      let friendToUse = selectedFriend;
+      let friendToUse = friends.find((f) => f.matchId === matchToLoadId) || null;
 
-      // --- 1. Fetch Friend/Match Details if not already set or correct ---
-      if (!friendToUse || friendToUse.matchId !== matchToLoadId) {
-        // Look in the locally loaded friends list first
-        friendToUse = friends.find((f) => f.matchId === matchToLoadId) || null;
+      // --- 1. Fallback: Query DB if friend not found locally ---
+      if (!friendToUse) {
+        const { data: friendRow } = await supabase
+          .from("friends")
+          .select("user_a, user_b")
+          .eq("match_id", matchToLoadId)
+          .or(`user_a.eq.${currentUser.id},user_b.eq.${currentUser.id}`)
+          .maybeSingle();
 
-        // Fallback: Query the database only if not found locally AND a matchId is in the URL
-        if (!friendToUse && targetMatchId) {
-          // Check for friendship (as you correctly did)
-          const { data: friendRow, error: friendError } = await supabase
-            .from("friends")
-            .select("user_a, user_b")
-            .eq("match_id", matchToLoadId)
-            .or(`user_a.eq.${currentUser.id},user_b.eq.${currentUser.id}`)
-            .maybeSingle(); // Use maybeSingle to get null on no match
-
-          if (friendError) {
-            console.error(`Error checking friendship for match ID ${matchToLoadId}:`, friendError);
-          }
-
-          if (!friendRow) {
-            // 🛑 CRITICAL CHANGE: Only redirect to access-denied if a matchId was in the URL
-            console.warn(`DEBUG: No friendship found in DB for URL match ID ${matchToLoadId}. Access denied.`);
-            navigate("/inbox/access-denied");
-            setIsLoadingMessages(false);
-            return;
-          }
-
-          const otherUserId = friendRow.user_a === currentUser.id ? friendRow.user_b : friendRow.user_a;
-          const { data: userData } = await supabase.from("users").select("username").eq("id", otherUserId).single();
-
-          friendToUse = {
-            matchId: matchToLoadId,
-            userId: otherUserId,
-            username: userData?.username || "Unknown",
-            lastMessageTime: null,
-            unread: 0,
-          };
-        }
-
-        // Update state if a valid friend was found
-        if (friendToUse) {
-          setSelectedFriend(friendToUse);
-        } else {
-          // Fallback for cases where matchToLoadId exists but no friend data was retrieved
-          // (e.g., if matchId was in URL but the DB check above was skipped/failed)
+        if (!friendRow) {
+          // Not a friend, deny access
+          console.warn(`No friendship found in DB for match ID ${matchToLoadId}. Access denied.`);
           navigate("/inbox/access-denied");
-          setIsLoadingMessages(false);
+          setIsLoadingMessages(false); // 💡 Ensure loading state is cleared here
           return;
         }
+
+        // If found in DB, construct the temporary friend object
+        const otherUserId = friendRow.user_a === currentUser.id ? friendRow.user_b : friendRow.user_a;
+        const { data: userData } = await supabase.from("users").select("username").eq("id", otherUserId).single();
+
+        friendToUse = {
+          matchId: matchToLoadId,
+          userId: otherUserId,
+          username: userData?.username || "Unknown",
+          lastMessageTime: null,
+          unread: 0,
+        };
+      }
+
+      // 💡 Update selectedFriend state if necessary
+      if (selectedFriend?.matchId !== friendToUse?.matchId) {
+        setSelectedFriend(friendToUse);
+      }
+
+      if (!friendToUse) {
+        // Final safety net, should not be reached
+        setIsLoadingMessages(false);
+        return;
       }
 
       // --- 2. Fetch Messages ---
@@ -209,10 +198,13 @@ const Inbox = () => {
         .eq("match_id", matchToLoadId)
         .order("sent_at", { ascending: true });
 
+      // 💡 ONLY check if matchToLoadId is the current active ref (prevents old requests from running)
       if (error || cancelled || activeMatchRef.current !== matchToLoadId) {
         setIsLoadingMessages(false);
         return;
       }
+
+      // ... rest of message processing ...
 
       setMessages(
         data.map((msg: any) => ({
@@ -224,6 +216,7 @@ const Inbox = () => {
       );
 
       // --- 3. Mark as Read and Update Sidebar ---
+      // ... (Your existing mark as read logic)
       await supabase
         .from("messages")
         .update({ is_read: true })
@@ -231,11 +224,12 @@ const Inbox = () => {
         .neq("sender_id", currentUser.id)
         .is("is_read", false);
 
-      if (friendToUse) {
-        setFriends((prev) => prev.map((f) => (f.matchId === matchToLoadId ? { ...f, unread: 0 } : f)));
-      }
+      // No need to update the entire friends list here, only the unread count (which is handled by mark as read).
+      // The main loadFriends useEffect handles full list updates.
 
-      setIsLoadingMessages(false);
+      setFriends((prev) => prev.map((f) => (f.matchId === matchToLoadId ? { ...f, unread: 0 } : f)));
+
+      setIsLoadingMessages(false); // 🤩 CRITICAL: Reached the end, clear loading state!
     };
 
     loadMessagesAndFriend();
@@ -243,26 +237,71 @@ const Inbox = () => {
     return () => {
       cancelled = true;
     };
-  }, [matchId, friends, currentUser, navigate, selectedFriend]); // Dependencies remain the same
+    // 💡 IMPORTANT: Removed 'friends' and 'selectedFriend' from dependencies
+  }, [matchId, currentUser, navigate]);
+
+  // Auto-scroll to the bottom when messages update or selected friend changes
+  useEffect(() => {
+    // Use requestAnimationFrame to ensure the DOM is painted with the new messages
+    // before attempting to scroll to them.
+    const scrollToBottom = () => {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    };
+
+    requestAnimationFrame(scrollToBottom);
+
+    // 💡 CRITICAL DEPENDENCY: Scroll when the messages array changes.
+    // Including selectedFriend ensures it scrolls correctly when you first load a chat.
+  }, [messages, selectedFriend]);
+
+  // NEW useEffect: Forcing scroll on initial load completion
+  useEffect(() => {
+    // Only execute if messages have been loaded AND it's the first time
+    // this chat is being displayed (i.e., when messages.length > 0).
+    if (messages.length > 0) {
+      // A small timeout (50ms is enough) ensures the scroll runs AFTER the
+      // browser finishes rendering the entire fetched message list.
+      const timer = setTimeout(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "instant" }); // Use 'instant' for initial load for snappier experience
+      }, 50);
+
+      return () => clearTimeout(timer);
+    }
+    // 💡 Dependency: Only run when the messages list is first populated.
+  }, [messages]);
 
   // Realtime listener
   useEffect(() => {
-    if (!selectedFriend || !currentUser) return;
+    // Use the matchId from the URL params to determine the active channel
+    const currentMatchId = matchId ? parseInt(matchId) : null;
+
+    // Only subscribe if a user is logged in AND a specific chat is active in the URL
+    if (!currentUser || !currentMatchId) return;
 
     const channel = supabase
-      .channel(`messages-${selectedFriend.matchId}`)
+      .channel(`messages-${currentMatchId}`) // Use URL matchId for stable channel name
       .on(
         "postgres_changes",
         {
           event: "INSERT",
           schema: "public",
           table: "messages",
-          filter: `match_id=eq.${selectedFriend.matchId}`,
+          filter: `match_id=eq.${currentMatchId}`, // Filter by current matchId
         },
         async (payload: any) => {
           const newMsg = payload.new;
-          if (activeMatchRef.current !== selectedFriend.matchId) return; // ignore old channels
+
+          // 1. Ignore self-sent messages (already handled by optimistic update)
+          if (newMsg.sender_id === currentUser.id) {
+            return;
+          }
+
+          // 2. Ignore messages for an old/inactive chat
+          if (activeMatchRef.current !== currentMatchId) return;
+
+          // 3. Update state for the received message
           setMessages((prev) => [
+            // Use callback to ensure latest state is used
             ...prev,
             {
               id: newMsg.id,
@@ -272,40 +311,79 @@ const Inbox = () => {
             },
           ]);
 
-          if (newMsg.sender_id !== currentUser.id) {
-            await supabase.from("messages").update({ is_read: true }).eq("id", newMsg.id);
-          }
+          // 4. Mark the received message as read
+          await supabase.from("messages").update({ is_read: true }).eq("id", newMsg.id);
+
+          // 5. Update friends list unread count (clear the badge for the active chat)
+          setFriends((prev) => prev.map((f) => (f.matchId === currentMatchId ? { ...f, unread: 0 } : f)));
         }
       )
       .subscribe();
 
     return () => {
+      // Cleanup: Unsubscribe from the channel when the component unmounts or dependencies change
       supabase.removeChannel(channel);
     };
-  }, [selectedFriend, currentUser]);
+    // 💡 CRITICAL: Depend only on matchId and currentUser for stability
+  }, [matchId, currentUser]);
 
+  // Send message
   // Send message
   const handleSendMessage = async () => {
     if (!messageInput.trim() || !selectedFriend || !currentUser) return;
-    setIsSending(true);
 
+    const newMessageContent = messageInput.trim();
+    // 1. Clear input and set state
+    setMessageInput("");
+    setIsSending(true); // Still set this to prevent double-sends
+
+    // 2. Prepare local temporary message
+    const tempMessage: Message = {
+      id: Date.now(),
+      senderId: currentUser.id,
+      content: newMessageContent,
+      sentAt: new Date().toISOString(),
+    };
+
+    // 3. Optimistically add to messages state
+    setMessages((prev) => [...prev, tempMessage]);
+
+    // 4. Send to database
     const { error } = await supabase.from("messages").insert({
       match_id: selectedFriend.matchId,
       sender_id: currentUser.id,
-      content: messageInput.trim(),
-      is_read: false,
+      content: newMessageContent,
+      is_read: true,
     });
 
-    if (error)
+    // 5. Re-enable input (MUST be after the await)
+    setIsSending(false);
+
+    if (error) {
+      // 6. Rollback:
+      setMessages((prev) => prev.filter((msg) => msg.id !== tempMessage.id));
+      setMessageInput(newMessageContent);
       toast({
         title: "Error",
         description: "Failed to send message",
         variant: "destructive",
       });
-    else setMessageInput("");
-
-    setIsSending(false);
+    }
   };
+  // New useEffect for Focus
+  useEffect(() => {
+    // 1. Only run if the input is empty (meaning a message was just sent)
+    // AND the chat window is visible.
+    if (messageInput === "" && selectedFriend && !isSending) {
+      // 2. Wait until the next browser paint to ensure the input is fully rendered/enabled.
+      requestAnimationFrame(() => {
+        messageInputRef.current?.focus();
+      });
+    }
+
+    // 3. Depend on messageInput to trigger after it's cleared,
+    // and selectedFriend/isSending for conditional re-focusing.
+  }, [messageInput, selectedFriend, isSending]);
 
   // Delete + Block
   const handleDeleteAndBlock = async (friend: Friend) => {
@@ -360,7 +438,7 @@ const Inbox = () => {
     );
 
   return (
-    <div className="min-h-screen flex bg-background">
+    <div className="h-screen flex bg-background">
       {/* Sidebar */}
       <div className="w-80 border-r-2 border-border flex flex-col">
         <div className="p-4 border-b-2 border-border">
@@ -372,7 +450,7 @@ const Inbox = () => {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 h-0">
           {friends.length === 0 ? (
             <div className="p-4 text-center text-sm font-mono text-muted-foreground">No matches yet. Start swapping skills!</div>
           ) : (
@@ -458,6 +536,7 @@ const Inbox = () => {
                   );
                 })
               )}
+              <div ref={messagesEndRef} />
             </div>
 
             <div className="p-4 border-t-2 border-border" position-fixed>
@@ -475,6 +554,7 @@ const Inbox = () => {
                   }}
                   disabled={isSending}
                   className="flex-1 font-mono border-2"
+                  ref={messageInputRef}
                 />
                 <Button
                   onClick={handleSendMessage}
