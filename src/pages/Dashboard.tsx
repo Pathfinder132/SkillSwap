@@ -2,13 +2,11 @@ import React, { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { toast } from "@/hooks/use-toast";
 import { useNavigate } from "react-router-dom";
-import { Search, LogOut, Send } from "lucide-react";
+import { Search, LogOut, Send, MessageSquare } from "lucide-react";
 
-// --- Interfaces ---
 interface UserSkill {
   id: number;
   skill: string;
@@ -37,7 +35,6 @@ interface SkillListing {
   description: string;
 }
 
-// --- Mock Skill Listings Data ---
 const mockSkillListings: SkillListing[] = [
   {
     id: "1",
@@ -62,6 +59,9 @@ const mockSkillListings: SkillListing[] = [
   },
 ];
 
+const MATCH_TIMEOUT = 5000;
+const POLL_INTERVAL = 2000;
+
 const Dashboard = () => {
   const navigate = useNavigate();
   const [user, setUser] = useState<UserData | null>(null);
@@ -69,16 +69,14 @@ const Dashboard = () => {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null);
   const [isMatching, setIsMatching] = useState(false);
-  const [matchFound, setMatchFound] = useState<{ username: string } | null>(null);
+  const [matchFound, setMatchFound] = useState<{ username: string; matchId: number } | null>(null);
 
-  // Filter mock listings by searchQuery for demo
   const filteredListings = mockSkillListings.filter(
     (listing) =>
       listing.skillName.toLowerCase().includes(searchQuery.toLowerCase()) ||
       listing.username.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  // Fetch logged-in user
   const fetchUser = async () => {
     try {
       const { data: currentUser } = await supabase.auth.getUser();
@@ -89,6 +87,7 @@ const Dashboard = () => {
         .select("id, username, email, skillpoints, swapscompleted, user_skills(*)")
         .eq("id", currentUser.user.id)
         .single();
+
       if (error) throw error;
 
       setUser({
@@ -97,7 +96,11 @@ const Dashboard = () => {
         email: data.email,
         skillpoints: data.skillpoints,
         swapscompleted: data.swapscompleted,
-        skills: data.user_skills.map((s: any) => ({ id: s.id, skill: s.skill, proficiency: s.proficiency })),
+        skills: data.user_skills.map((s: any) => ({
+          id: s.id,
+          skill: s.skill,
+          proficiency: s.proficiency,
+        })),
       });
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
@@ -105,11 +108,13 @@ const Dashboard = () => {
     }
   };
 
-  // Fetch all available skills dynamically
   const fetchSkills = async () => {
     const { data, error } = await supabase.from("skills").select("id, name").order("name");
-    if (error) console.error(error);
-    else setSkills(data || []);
+    if (error) {
+      console.error("Error fetching skills:", error);
+    } else {
+      setSkills(data || []);
+    }
   };
 
   const handleLogout = async () => {
@@ -120,7 +125,11 @@ const Dashboard = () => {
 
   const handleRequestMatch = async () => {
     if (!selectedSkill) {
-      toast({ title: "Error", description: "Please select a skill from the list.", variant: "destructive" });
+      toast({
+        title: "Error",
+        description: "Please select a skill from the list.",
+        variant: "destructive",
+      });
       return;
     }
     if (!user) return;
@@ -128,48 +137,34 @@ const Dashboard = () => {
     setIsMatching(true);
     setMatchFound(null);
 
-    console.log("🔍 Requesting match for skill:", selectedSkill.name, "ID:", selectedSkill.id);
+    console.log("Requesting match for skill:", selectedSkill.name);
 
-    const { data, error } = await supabase
-      .from("requests")
-      .insert({
-        user_id: user.id,
-        username: user.username,
-        skill_requested: selectedSkill.id,
-      })
-      .select();
+    const { error } = await supabase.from("requests").insert({
+      user_id: user.id,
+      username: user.username,
+      skill_requested: selectedSkill.id,
+    });
 
     if (error) {
-      console.error("❌ Error inserting request:", error);
+      console.error("Error inserting request:", error);
       toast({ title: "Error", description: error.message, variant: "destructive" });
       setIsMatching(false);
       return;
     }
 
-    console.log("✅ Request inserted:", data);
-
-    // If no match found within 5 seconds, stop loading
-    setTimeout(() => {
-      if (isMatching && !matchFound) {
-        setIsMatching(false);
-        toast({
-          title: "No match found yet",
-          description: "Your request is active. We'll notify you when someone matches!",
-        });
-      }
-    }, 5000);
+    console.log("Request inserted successfully");
   };
 
-  // ⚡ Realtime listener for matches
-  // Polling solution - check for matches every 2 seconds when searching
   useEffect(() => {
     if (!isMatching || !user) return;
 
-    console.log("🔄 Starting polling for matches...");
+    let matchCheckCount = 0;
+    const maxChecks = Math.ceil(MATCH_TIMEOUT / POLL_INTERVAL);
 
     const pollForMatch = async () => {
       try {
-        // Check if user has any recent matches
+        matchCheckCount++;
+
         const { data: matches, error } = await supabase
           .from("matches")
           .select("id, user_a, user_b, matched_at")
@@ -178,7 +173,7 @@ const Dashboard = () => {
           .limit(1);
 
         if (error) {
-          console.error("❌ Error polling for match:", error);
+          console.error("Error polling for match:", error);
           return;
         }
 
@@ -186,36 +181,84 @@ const Dashboard = () => {
           const match = matches[0];
           const otherUserId = match.user_a === user.id ? match.user_b : match.user_a;
 
-          // Fetch the other user's username
           const { data: otherUser } = await supabase.from("users").select("username").eq("id", otherUserId).single();
 
           if (otherUser?.username) {
-            console.log("✅ Found match via polling:", otherUser.username);
-            setMatchFound({ username: otherUser.username });
+            console.log("Match found:", otherUser.username);
+            setMatchFound({ username: otherUser.username, matchId: match.id });
             setIsMatching(false);
             toast({
               title: "Match Found!",
               description: `You matched with ${otherUser.username}!`,
-              duration: 5000,
+              duration: 7000,
             });
+            return;
           }
         }
+
+        if (matchCheckCount >= maxChecks) {
+          setIsMatching(false);
+          toast({
+            title: "No users online",
+            description: "No match found right now. Check your inbox later when a match is found!",
+            duration: 5000,
+          });
+        }
       } catch (err) {
-        console.error("❌ Polling error:", err);
+        console.error("Polling error:", err);
       }
     };
 
-    // Poll immediately
     pollForMatch();
-
-    // Then poll every 2 seconds
-    const interval = setInterval(pollForMatch, 2000);
+    const interval = setInterval(pollForMatch, POLL_INTERVAL);
 
     return () => {
-      console.log("⏹️ Stopping polling");
       clearInterval(interval);
     };
   }, [isMatching, user]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    console.log("Setting up Realtime listener for matches");
+
+    const channel = supabase
+      .channel(`matches-${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "matches",
+        },
+        async (payload) => {
+          const match = payload.new;
+
+          if (match.user_a === user.id || match.user_b === user.id) {
+            const otherUserId = match.user_a === user.id ? match.user_b : match.user_a;
+            const { data: otherUser } = await supabase.from("users").select("username").eq("id", otherUserId).single();
+
+            if (otherUser?.username) {
+              console.log("Match notification received:", otherUser.username);
+              setMatchFound({ username: otherUser.username, matchId: match.id });
+              toast({
+                title: "Match Found!",
+                description: `You matched with ${otherUser.username}!`,
+                duration: 7000,
+              });
+            }
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log("Realtime subscription status:", status);
+      });
+
+    return () => {
+      console.log("Unsubscribing from Realtime");
+      supabase.removeChannel(channel);
+    };
+  }, [user]);
 
   useEffect(() => {
     fetchUser();
@@ -224,34 +267,41 @@ const Dashboard = () => {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-50 border-b-2 border-border bg-background">
         <div className="container mx-auto px-4 py-4 flex items-center justify-between gap-4">
           <h1 className="text-2xl font-bold font-mono">SKILLSWAP</h1>
 
-          {/* Searchbar */}
           <div className="relative flex-1 max-w-md">
             <input
               type="text"
               placeholder="> search skills..."
               value={searchQuery}
               onChange={(e) => {
-                setSearchQuery(e.target.value);
-                const found = skills.find((s) => s.name.toLowerCase() === e.target.value.toLowerCase());
+                const query = e.target.value;
+                setSearchQuery(query);
+                const found = skills.find((s) => s.name.toLowerCase() === query.toLowerCase());
                 setSelectedSkill(found || null);
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleRequestMatch();
               }}
-              className="pl-10 pr-10 font-mono border-2 bg-background w-full"
+              disabled={isMatching}
+              className="pl-10 pr-10 font-mono border-2 bg-background w-full disabled:opacity-50"
             />
-            <button onClick={handleRequestMatch} className="absolute right-1 top-1/2 transform -translate-y-1/2 p-1">
-              <Search className="w-5 h-5 text-muted-foreground" />
+            <button
+              onClick={handleRequestMatch}
+              disabled={isMatching}
+              className="absolute right-1 top-1/2 transform -translate-y-1/2 p-1 disabled:opacity-50"
+            >
+              {isMatching ? (
+                <div className="w-5 h-5 border-2 border-muted-foreground border-t-foreground rounded-full animate-spin" />
+              ) : (
+                <Search className="w-5 h-5 text-muted-foreground" />
+              )}
             </button>
 
-            {/* Suggestions Dropdown */}
-            {searchQuery && (
-              <ul className="absolute z-50 bg-background border border-border mt-1 w-full max-h-40 overflow-y-auto">
+            {searchQuery && !isMatching && !matchFound && (
+              <ul className="absolute z-50 bg-background border border-border mt-1 w-full max-h-40 overflow-y-auto shadow-lg">
                 {skills
                   .filter((s) => s.name.toLowerCase().includes(searchQuery.toLowerCase()))
                   .map((s) => (
@@ -269,13 +319,20 @@ const Dashboard = () => {
               </ul>
             )}
 
-            {/* Matching Animation / Result */}
-            {isMatching && <div className="mt-2 text-center font-mono text-sm animate-pulse">🔄 Searching for a match...</div>}
-            {matchFound && (
-              <div className="mt-2 text-center font-mono text-sm text-green-500">
-                ✅ Found your match! His name is {matchFound.username}
-              </div>
-            )}
+            <div className="absolute top-full left-0 w-full text-center mt-2 font-mono text-sm pointer-events-none">
+              {isMatching && <div className="animate-pulse text-muted-foreground">🔄 Searching for a match...</div>}
+              {matchFound && (
+                <div className="text-green-500 flex items-center justify-center gap-2">
+                  ✅ Matched with {matchFound.username}!
+                  <button
+                    onClick={() => navigate(`/inbox/${matchFound.matchId}`)}
+                    className="px-2 py-1 bg-green-600 text-white rounded text-xs font-mono hover:bg-green-700 pointer-events-auto"
+                  >
+                    Go to Chat!
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="flex items-center gap-4">
@@ -291,8 +348,17 @@ const Dashboard = () => {
             <Button
               variant="ghost"
               size="icon"
+              onClick={() => navigate("/inbox")}
+              className="border-2 border-border hover:bg-secondary"
+              title="View Chats"
+            >
+              <MessageSquare className="w-4 h-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
               onClick={handleLogout}
-              className="border-2 border-border hover:bg-destructive hover:text-destructive-foreground transition-smooth"
+              className="border-2 border-border hover:bg-destructive hover:text-destructive-foreground"
             >
               <LogOut className="w-4 h-4" />
             </Button>
@@ -300,13 +366,12 @@ const Dashboard = () => {
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="container mx-auto px-4 py-8">
         <h2 className="text-xl font-bold font-mono mb-6">AVAILABLE SKILL SWAPS</h2>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
           {filteredListings.map((listing) => (
-            <Card key={listing.id} className="p-6 border-2 border-border hover:border-foreground transition-smooth">
+            <Card key={listing.id} className="p-6 border-2 border-border hover:border-foreground transition-all">
               <div className="flex items-start justify-between mb-4">
                 <div className="flex items-center gap-3">
                   <Avatar className="border-2 border-border">
@@ -329,16 +394,26 @@ const Dashboard = () => {
 
               <div className="flex gap-2">
                 <Button
-                  onClick={handleRequestMatch}
-                  className="flex-1 font-mono font-bold border-2 border-foreground hover:bg-foreground hover:text-background transition-smooth"
+                  onClick={() =>
+                    toast({
+                      title: "Demo Feature",
+                      description: "Use the search bar above to find real matches!",
+                    })
+                  }
+                  className="flex-1 font-mono font-bold border-2 border-foreground hover:bg-foreground hover:text-background"
                   variant="outline"
                 >
                   MATCH (5 PTS)
                 </Button>
                 <Button
-                  onClick={() => toast({ title: "Chat Initiated!", description: `Starting chat with ${listing.username}.` })}
+                  onClick={() =>
+                    toast({
+                      title: "Chat Feature",
+                      description: "Chat will be available after matching!",
+                    })
+                  }
                   variant="ghost"
-                  className="border-2 border-border hover:bg-secondary transition-smooth"
+                  className="border-2 border-border hover:bg-secondary"
                 >
                   <Send className="w-4 h-4" />
                 </Button>
@@ -347,7 +422,6 @@ const Dashboard = () => {
           ))}
         </div>
 
-        {/* User Skills & Stats */}
         <h2 className="text-xl font-bold font-mono mt-12 mb-6">YOUR SKILLS & STATS</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <Card className="p-6 border-2 border-border md:col-span-2">
@@ -355,9 +429,9 @@ const Dashboard = () => {
             <div className="space-y-3">
               {user?.skills.length ? (
                 user.skills.map((skill) => (
-                  <div key={skill.id} className="flex justify-between items-center p-3 border border-border">
+                  <div key={skill.id} className="flex justify-between items-center p-3 border border-border rounded">
                     <p className="font-mono font-bold text-sm">{skill.skill}</p>
-                    <span className="font-mono text-xs px-2 py-1 bg-secondary text-secondary-foreground">
+                    <span className="font-mono text-xs px-2 py-1 bg-secondary text-secondary-foreground rounded">
                       {skill.proficiency.toUpperCase()}
                     </span>
                   </div>

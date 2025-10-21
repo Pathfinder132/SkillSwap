@@ -3,6 +3,8 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router-d
 import Home from "./pages/Home";
 import Auth from "./pages/auth";
 import Dashboard from "./pages/Dashboard";
+import Inbox from "./pages/Inbox";
+import AccessDenied from "./pages/AccessDenied";
 import { supabase } from "@/lib/supabaseClient";
 
 const App = () => {
@@ -33,7 +35,7 @@ const App = () => {
             ) : (
               <Auth
                 setIsAuthenticated={(isAuth) => {
-                  if (isAuth) checkUser(); // fetch the actual logged-in user
+                  if (isAuth) checkUser();
                   else setUser(null);
                 }}
                 setCurrentPage={() => {}}
@@ -42,6 +44,9 @@ const App = () => {
           }
         />
         <Route path="/dashboard" element={user ? <Dashboard /> : <Navigate to="/auth" />} />
+        <Route path="/inbox" element={user ? <Inbox /> : <Navigate to="/auth" />} />
+        <Route path="/inbox/:matchId" element={user ? <Inbox /> : <Navigate to="/auth" />} />
+        <Route path="/inbox/access-denied" element={<AccessDenied />} />
       </Routes>
     </Router>
   );
