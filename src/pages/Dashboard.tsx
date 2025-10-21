@@ -59,8 +59,10 @@ const mockSkillListings: SkillListing[] = [
   },
 ];
 
-const MATCH_TIMEOUT = 5000;
-const POLL_INTERVAL = 2000;
+// ❌ Removed MATCH_TIMEOUT and POLL_INTERVAL constants as they are no longer used for polling.
+
+// ✅ NEW CONSTANT: Set a generous max search time for the animation.
+const MAX_SEARCH_DURATION = 30000; // 30 seconds
 
 const Dashboard = () => {
   const navigate = useNavigate();
@@ -146,15 +148,32 @@ const Dashboard = () => {
   };
 
   const handleRequestMatch = async () => {
-    // ... (existing validation and setup)
+    // 1. CRITICAL VALIDATION CHECK
+    if (!user) {
+      toast({ title: "Authentication Error", description: "You must be logged in to request a match.", variant: "destructive" });
+      // Use an early return to stop execution if the user object is not available
+      return;
+    }
 
+    // 2. CRITICAL SKILL SELECTION CHECK
+    if (!selectedSkill) {
+      toast({
+        title: "Validation Error",
+        description: "Please select a skill from the dropdown before searching.",
+        variant: "destructive",
+      });
+      // Use an early return to stop execution
+      return;
+    }
+
+    // Set matching state *before* the async call
     setIsMatching(true);
     setMatchFound(null);
     setCurrentRequestId(null); // Clear previous ID
 
     console.log("Requesting match for skill:", selectedSkill.name);
 
-    // Capture the inserted data
+    // 3. DATABASE INSERTION
     const { data, error } = await supabase
       .from("requests")
       .insert({
@@ -166,100 +185,72 @@ const Dashboard = () => {
       .single();
 
     if (error) {
-      // ... (existing error handling)
+      console.error("Supabase Insert Error:", error);
+      toast({
+        title: "Error creating request",
+        description: `Failed to insert request: ${error.message}. Check Supabase rules.`,
+        variant: "destructive",
+      });
+      // CRITICAL: Reset state on DB error
       setIsMatching(false);
       return;
     }
 
     console.log("Request inserted successfully, ID:", data.id);
-    setCurrentRequestId(data.id); // <-- SET the new ID
+    setCurrentRequestId(data.id); // <-- SET the new ID to trigger the search timeout/listener
+    // Do NOT set setIsMatching(false) here, as it stops the search animation immediately
   };
 
-  // Polling logic kept for safety (backend creates matches). This will still run
-  // but the primary notification of match will come from realtime listener below.
-  // Replacement for your existing useEffect polling logic
-  // Replacement for your existing useEffect polling logic
+  // ❌ REMOVED: The entire polling useEffect block (lines 142-205 in the original file)
+  // has been replaced by the timeout logic below.
+
+  // ✅ NEW EFFECT: Controls the search animation timeout and cleans up un-matched requests.
   useEffect(() => {
-    // 🛑 CRITICAL: We now require a request ID to be set before polling starts.
+    // Only run if a request ID is set and we are actively matching
     if (!isMatching || !user || currentRequestId === null) return;
 
-    let matchCheckCount = 0;
-    const maxChecks = Math.ceil(MATCH_TIMEOUT / POLL_INTERVAL);
+    console.log(`Starting max search timeout for Request ID: ${currentRequestId}`);
 
-    const pollForMatch = async () => {
-      try {
-        matchCheckCount++;
-
-        // CHECK: Does the original request still exist?
-        // This is the single most important check for the "already friends" scenario.
-        const { error: reqError, count: reqCount } = await supabase
-          .from("requests")
-          .select("id", { count: "exact", head: true })
-          .eq("id", currentRequestId);
-
-        if (reqError) throw reqError;
-
-        // If the request is GONE (reqCount === 0), it means:
-        // 1. A NEW match was found (handled by the Realtime listener which should have already fired).
-        // 2. The match was an existing friend (handled by the SQL trigger's 'delete' block).
-        // In case #2, we MUST clear the stale matchFound state.
-        if (reqCount === 0) {
-          // If the user's state hasn't been updated by the Realtime listener (e.g., if they were
-          // matched with an existing friend), we stop searching and reset the state.
-
-          // Check if Realtime *already* set matchFound for a new match.
-          if (!matchFound) {
-            // No new match was found, therefore the request was deleted due to existing friendship.
-            setIsMatching(false);
-            // Explicitly clear any stale/old match state left over from a previous session
-            setMatchFound(null);
-            setCurrentRequestId(null); // Clean up
-
-            toast({
-              title: "Existing Connection Found",
-              description: "You've already matched with a user who requested that skill! Check your inbox.",
-              duration: 7000,
-            });
-            return; // Stop polling
-          }
-
-          // If matchFound is true, the realtime listener already handled the successful match,
-          // so we just stop the polling loop.
-          setIsMatching(false);
-          setCurrentRequestId(null);
-          return;
-        }
-
-        // -------------------------------------------------------------
-        // Standard Timeout Logic (Only runs if request still exists)
-        // -------------------------------------------------------------
-        if (matchCheckCount >= maxChecks) {
-          setIsMatching(false);
-          setCurrentRequestId(null); // Clean up
-          setMatchFound(null); // Explicitly clear any stale match state
-
-          toast({
-            title: "No users online",
-            description: "No reciprocal match found right now. Your request is open!",
-            duration: 5000,
-          });
-        }
-      } catch (err) {
-        console.error("Polling error:", err);
-        // On error, stop matching
-        setIsMatching(false);
-        setCurrentRequestId(null);
-        setMatchFound(null);
+    // Set a timer for the maximum allowed search duration
+    const endSearchTimer = setTimeout(async () => {
+      // If matchFound is already set by the Realtime listener, a match occurred, so do nothing.
+      if (matchFound) {
+        console.log("Match found via Realtime, ignoring timeout cleanup.");
+        return;
       }
-    };
 
-    pollForMatch();
-    const interval = setInterval(pollForMatch, POLL_INTERVAL);
+      // No match found by the end of MAX_SEARCH_DURATION (30 seconds).
+      console.log("Max search duration reached. Stopping search and cleaning up request.");
 
+      // Stop the client-side animation
+      setIsMatching(false);
+
+      // Attempt to remove the request from the DB. This handles the case where the
+      // SQL function didn't find a match and didn't clean it up for some reason,
+      // or if the user was AFK/disconnected.
+      const { error: deleteError } = await supabase.from("requests").delete().eq("id", currentRequestId).eq("user_id", user.id);
+
+      // Note: PGRST116 error code means "not found", which is fine if the backend
+      // cleaned it up, so we only log other errors.
+      if (deleteError && deleteError.code !== "PGRST116") {
+        console.error("Error cleaning up request:", deleteError);
+      }
+
+      setCurrentRequestId(null);
+      setMatchFound(null);
+
+      toast({
+        title: "No Match Found",
+        description: "No reciprocal match was found right now. Try again later!",
+        duration: 5000,
+      });
+    }, MAX_SEARCH_DURATION);
+
+    // Clean up the timer if the component unmounts or a match is found before the timeout
     return () => {
-      clearInterval(interval);
+      clearTimeout(endSearchTimer);
     };
-  }, [isMatching, user, currentRequestId, matchFound]); // Added matchFound to dependencies // Dependency on currentRequestId is important
+  }, [isMatching, user, currentRequestId, matchFound]);
 
   // Realtime listener for matches (notifies when backend inserts into matches)
   useEffect(() => {
@@ -283,6 +274,7 @@ const Dashboard = () => {
             if (otherUser?.username) {
               console.log("Realtime match detected:", otherUser.username);
               setMatchFound({ username: otherUser.username, matchId: match.id });
+              // This is the success path: stop matching animation immediately
               setIsMatching(false);
               toast({
                 title: "Match Found!",
